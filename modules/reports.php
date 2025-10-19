@@ -157,7 +157,7 @@ $total_discount = array_sum(array_column($sales_report, 'total_discount'));
     <link href="https://cdn.jsdelivr.net/npm/chart.js@3.9.1/dist/chart.min.css" rel="stylesheet">
     <link href="https://fonts.googleapis.com/css2?family=Phetsarath+OT:wght@400;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.5/font/bootstrap-icons.css">
-    <link rel="stylesheet" href="css/style.css">
+    <link rel="stylesheet" href="../css/style.css">
     <style>
         .page-header {
             background: linear-gradient(120deg, #4361ee, #3f37c9);
@@ -293,7 +293,7 @@ $total_discount = array_sum(array_column($sales_report, 'total_discount'));
                             </div>
                             <div class="col-md-6 text-md-end">
                                 <div class="export-buttons">
-                                    <button class="btn btn-light" onclick="printReport()">
+                                    <button class="btn btn-light" onclick="window.print()">
                                         <i class="bi bi-printer me-1"></i> พิมพ์รายงาน
                                     </button>
                                     <button class="btn btn-light" onclick="exportToPDF()">
@@ -434,8 +434,9 @@ $total_discount = array_sum(array_column($sales_report, 'total_discount'));
                                             <tbody>
                                                 <?php 
                                                 $total_sold = array_sum(array_column($top_products, 'total_sold'));
-                                                foreach ($top_products as $product): 
-                                                    $percentage = $total_sold > 0 ? ($product['total_sold'] / $total_sold) * 100 : 0;
+                                                if (count($top_products) > 0):
+                                                    foreach ($top_products as $product): 
+                                                        $percentage = $total_sold > 0 ? ($product['total_sold'] / $total_sold) * 100 : 0;
                                                 ?>
                                                     <tr>
                                                         <td>
@@ -462,6 +463,14 @@ $total_discount = array_sum(array_column($sales_report, 'total_discount'));
                                                         </td>
                                                     </tr>
                                                 <?php endforeach; ?>
+                                                <?php else: ?>
+                                                    <tr>
+                                                        <td colspan="4" class="text-center text-muted py-3">
+                                                            <i class="bi bi-inbox display-4 d-block mb-2"></i>
+                                                            ไม่มีข้อมูลการขายในช่วงเวลานี้
+                                                        </td>
+                                                    </tr>
+                                                <?php endif; ?>
                                             </tbody>
                                         </table>
                                     </div>
@@ -488,39 +497,39 @@ $total_discount = array_sum(array_column($sales_report, 'total_discount'));
                                                 </tr>
                                             </thead>
                                             <tbody>
-                                                <?php foreach ($stock_alerts as $product): 
-                                                    $stock_percentage = min(100, ($product['quantity'] / 5) * 100);
-                                                    $status_class = $product['quantity'] == 0 ? 'danger' : ($product['quantity'] <= 2 ? 'warning' : 'info');
-                                                    $status_text = $product['quantity'] == 0 ? 'หมด' : ($product['quantity'] <= 2 ? 'ใกล้หมด' : 'พอใช้');
-                                                ?>
-                                                    <tr>
-                                                        <td>
-                                                            <div class="d-flex align-items-center">
-                                                                <div class="bg-info rounded-circle d-flex align-items-center justify-content-center me-2" style="width: 36px; height: 36px;">
-                                                                    <i class="bi bi-box text-white"></i>
+                                                <?php if (count($stock_alerts) > 0): ?>
+                                                    <?php foreach ($stock_alerts as $product): 
+                                                        $stock_percentage = min(100, ($product['quantity'] / 5) * 100);
+                                                        $status_class = $product['quantity'] == 0 ? 'danger' : ($product['quantity'] <= 2 ? 'warning' : 'info');
+                                                        $status_text = $product['quantity'] == 0 ? 'หมด' : ($product['quantity'] <= 2 ? 'ใกล้หมด' : 'พอใช้');
+                                                    ?>
+                                                        <tr>
+                                                            <td>
+                                                                <div class="d-flex align-items-center">
+                                                                    <div class="bg-info rounded-circle d-flex align-items-center justify-content-center me-2" style="width: 36px; height: 36px;">
+                                                                        <i class="bi bi-box text-white"></i>
+                                                                    </div>
+                                                                    <div>
+                                                                        <strong><?php echo htmlspecialchars($product['product_name']); ?></strong>
+                                                                        <br>
+                                                                        <small class="text-muted"><?php echo htmlspecialchars($product['product_code']); ?></small>
+                                                                    </div>
                                                                 </div>
-                                                                <div>
-                                                                    <strong><?php echo htmlspecialchars($product['product_name']); ?></strong>
-                                                                    <br>
-                                                                    <small class="text-muted"><?php echo htmlspecialchars($product['product_code']); ?></small>
+                                                            </td>
+                                                            <td>
+                                                                <span class="fw-bold"><?php echo number_format($product['quantity']); ?></span>
+                                                                <div class="progress mt-1" style="height: 5px;">
+                                                                    <div class="progress-bar bg-<?php echo $status_class; ?>" style="width: <?php echo $stock_percentage; ?>%"></div>
                                                                 </div>
-                                                            </div>
-                                                        </td>
-                                                        <td>
-                                                            <span class="fw-bold"><?php echo number_format($product['quantity']); ?></span>
-                                                            <div class="progress mt-1" style="height: 5px;">
-                                                                <div class="progress-bar bg-<?php echo $status_class; ?>" style="width: <?php echo $stock_percentage; ?>%"></div>
-                                                            </div>
-                                                        </td>
-                                                        <td>
-                                                            <span class="badge bg-<?php echo $status_class; ?>"><?php echo $status_text; ?></span>
-                                                        </td>
-                                                    </tr>
-                                                <?php endforeach; ?>
-                                                
-                                                <?php if (count($stock_alerts) === 0): ?>
+                                                            </td>
+                                                            <td>
+                                                                <span class="badge bg-<?php echo $status_class; ?>"><?php echo $status_text; ?></span>
+                                                            </td>
+                                                        </tr>
+                                                    <?php endforeach; ?>
+                                                <?php else: ?>
                                                     <tr>
-                                                        <td colspan="4" class="text-center text-muted py-3">
+                                                        <td colspan="3" class="text-center text-muted py-3">
                                                             <i class="bi bi-check-circle display-4 d-block mb-2"></i>
                                                             ไม่มีสินค้าใกล้หมด
                                                         </td>
@@ -616,109 +625,126 @@ $total_discount = array_sum(array_column($sales_report, 'total_discount'));
     <script>
         document.addEventListener('DOMContentLoaded', function() {
             // กราฟรายได้รายวัน
-            const revenueCtx = document.getElementById('dailyRevenueChart').getContext('2d');
-            const revenueChart = new Chart(revenueCtx, {
-                type: 'bar',
-                data: {
-                    labels: [<?php echo implode(',', array_map(function($item) { return "'" . date('d/m', strtotime($item['sale_day'])) . "'"; }, $sales_report)); ?>],
-                    datasets: [{
-                        label: 'รายได้ (บาท)',
-                        data: [<?php echo implode(',', array_column($sales_report, 'total_revenue')); ?>],
-                        backgroundColor: 'rgba(67, 97, 238, 0.7)',
-                        borderColor: 'rgba(67, 97, 238, 1)',
-                        borderWidth: 1
-                    }]
-                },
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: false,
-                    scales: {
-                        y: {
-                            beginAtZero: true,
-                            ticks: {
-                                callback: function(value) {
-                                    return '฿' + value.toLocaleString();
+            const revenueCtx = document.getElementById('dailyRevenueChart');
+            if (revenueCtx) {
+                const revenueChart = new Chart(revenueCtx.getContext('2d'), {
+                    type: 'bar',
+                    data: {
+                        labels: [<?php echo implode(',', array_map(function($item) { return "'" . date('d/m', strtotime($item['sale_day'])) . "'"; }, $sales_report)); ?>],
+                        datasets: [{
+                            label: 'รายได้ (บาท)',
+                            data: [<?php echo implode(',', array_column($sales_report, 'total_revenue')); ?>],
+                            backgroundColor: 'rgba(67, 97, 238, 0.7)',
+                            borderColor: 'rgba(67, 97, 238, 1)',
+                            borderWidth: 1
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        scales: {
+                            y: {
+                                beginAtZero: true,
+                                ticks: {
+                                    callback: function(value) {
+                                        return '฿' + value.toLocaleString();
+                                    }
                                 }
                             }
-                        }
-                    },
-                    plugins: {
-                        legend: {
-                            display: false
                         },
-                        tooltip: {
-                            callbacks: {
-                                label: function(context) {
-                                    return 'รายได้: ฿' + context.raw.toLocaleString();
+                        plugins: {
+                            legend: {
+                                display: false
+                            },
+                            tooltip: {
+                                callbacks: {
+                                    label: function(context) {
+                                        return 'รายได้: ฿' + context.raw.toLocaleString();
+                                    }
                                 }
                             }
                         }
                     }
-                }
-            });
+                });
+            }
             
             // กราฟวิธีการชำระเงิน
-            const paymentCtx = document.getElementById('paymentMethodsChart').getContext('2d');
-            const paymentChart = new Chart(paymentCtx, {
-                type: 'doughnut',
-                data: {
-                    labels: [<?php echo implode(',', array_map(function($item) { 
-                        $methods = [
-                            'cash' => 'เงินสด',
-                            'transfer' => 'โอนเงิน',
-                            'credit' => 'บัตรเครดิต',
-                            'qr' => 'QR Code'
-                        ];
-                        return "'" . ($methods[$item['payment_method']] ?? $item['payment_method']) . "'"; 
-                    }, $payment_methods)); ?>],
-                    datasets: [{
-                        data: [<?php echo implode(',', array_column($payment_methods, 'total_amount')); ?>],
-                        backgroundColor: [
-                            'rgba(67, 97, 238, 0.7)',
-                            'rgba(46, 204, 113, 0.7)',
-                            'rgba(241, 196, 15, 0.7)',
-                            'rgba(230, 126, 34, 0.7)'
-                        ],
-                        borderColor: [
-                            'rgba(67, 97, 238, 1)',
-                            'rgba(46, 204, 113, 1)',
-                            'rgba(241, 196, 15, 1)',
-                            'rgba(230, 126, 34, 1)'
-                        ],
-                        borderWidth: 1
-                    }]
-                },
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: false,
-                    plugins: {
-                        legend: {
-                            position: 'bottom'
-                        },
-                        tooltip: {
-                            callbacks: {
-                                label: function(context) {
-                                    const value = context.raw;
-                                    const total = context.dataset.data.reduce((a, b) => a + b, 0);
-                                    const percentage = Math.round((value / total) * 100);
-                                    return context.label + ': ฿' + value.toLocaleString() + ' (' + percentage + '%)';
+            const paymentCtx = document.getElementById('paymentMethodsChart');
+            if (paymentCtx) {
+                const paymentChart = new Chart(paymentCtx.getContext('2d'), {
+                    type: 'doughnut',
+                    data: {
+                        labels: [<?php echo implode(',', array_map(function($item) { 
+                            $methods = [
+                                'cash' => 'เงินสด',
+                                'transfer' => 'โอนเงิน',
+                                'credit' => 'บัตรเครดิต',
+                                'qr' => 'QR Code'
+                            ];
+                            return "'" . ($methods[$item['payment_method']] ?? $item['payment_method']) . "'"; 
+                        }, $payment_methods)); ?>],
+                        datasets: [{
+                            data: [<?php echo implode(',', array_column($payment_methods, 'total_amount')); ?>],
+                            backgroundColor: [
+                                'rgba(67, 97, 238, 0.7)',
+                                'rgba(46, 204, 113, 0.7)',
+                                'rgba(241, 196, 15, 0.7)',
+                                'rgba(230, 126, 34, 0.7)'
+                            ],
+                            borderColor: [
+                                'rgba(67, 97, 238, 1)',
+                                'rgba(46, 204, 113, 1)',
+                                'rgba(241, 196, 15, 1)',
+                                'rgba(230, 126, 34, 1)'
+                            ],
+                            borderWidth: 1
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: {
+                            legend: {
+                                position: 'bottom'
+                            },
+                            tooltip: {
+                                callbacks: {
+                                    label: function(context) {
+                                        const value = context.raw;
+                                        const total = context.dataset.data.reduce((a, b) => a + b, 0);
+                                        const percentage = Math.round((value / total) * 100);
+                                        return context.label + ': ฿' + value.toLocaleString() + ' (' + percentage + '%)';
+                                    }
                                 }
                             }
                         }
                     }
-                }
-            });
+                });
+            }
             
-            // ตั้งค่า DataTable สำหรับตาราง
-            $('.report-table').DataTable({
-                language: {
-                    url: '//cdn.datatables.net/plug-ins/1.13.6/i18n/th.json'
-                },
-                responsive: true,
-                ordering: true,
-                pageLength: 5,
-                lengthMenu: [5, 10, 25, 50],
-                dom: '<"row"<"col-md-6"l><"col-md-6"f>>rt<"row"<"col-md-6"i><"col-md-6"p>>'
+            // ตั้งค่า DataTable สำหรับตาราง - แก้ไขเพื่อรองรับตารางว่าง
+            $('.report-table').each(function() {
+                // ตรวจสอบว่าตารางมีข้อมูลหรือไม่
+                const $table = $(this);
+                const hasData = $table.find('tbody tr').length > 0 && 
+                               !$table.find('tbody tr td[colspan]').length;
+                
+                if (hasData) {
+                    $table.DataTable({
+                        language: {
+                            url: '//cdn.datatables.net/plug-ins/1.13.6/i18n/th.json'
+                        },
+                        responsive: true,
+                        ordering: true,
+                        pageLength: 5,
+                        lengthMenu: [5, 10, 25, 50],
+                        dom: '<"row"<"col-md-6"l><"col-md-6"f>>rt<"row"<"col-md-6"i><"col-md-6"p>>',
+                        // เพิ่ม options เพื่อจัดการกับตารางว่าง
+                        "columnDefs": [
+                            { "defaultContent": "-", "targets": "_all" }
+                        ]
+                    });
+                }
             });
         });
         

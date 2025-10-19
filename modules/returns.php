@@ -7,6 +7,46 @@ if (!isLoggedIn()) {
     exit;
 }
 
+// ฟังก์ชันบันทึกประวัติการเคลื่อนไหวสต็อก
+function logStockMovement($pdo, $product_id, $movement_type, $quantity, $note, $user_id) {
+    try {
+        $stmt = $pdo->prepare("
+            INSERT INTO stock_movements 
+            (product_id, movement_type, quantity, note, user_id, created_at) 
+            VALUES (?, ?, ?, ?, ?, NOW())
+        ");
+        return $stmt->execute([$product_id, $movement_type, $quantity, $note, $user_id]);
+    } catch (PDOException $e) {
+        error_log("Error logging stock movement: " . $e->getMessage());
+        return false;
+    }
+}
+
+// ฟังก์ชันตรวจสอบและสร้างตาราง stock_movements หากไม่มี
+function ensureStockMovementsTable($pdo) {
+    try {
+        $sql = "CREATE TABLE IF NOT EXISTS stock_movements (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            product_id INT NOT NULL,
+            movement_type ENUM('in', 'out', 'return', 'exchange_in', 'exchange_out') NOT NULL,
+            quantity INT NOT NULL,
+            note TEXT,
+            user_id INT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
+        )";
+        $pdo->exec($sql);
+        return true;
+    } catch (PDOException $e) {
+        error_log("Error creating stock_movements table: " . $e->getMessage());
+        return false;
+    }
+}
+
+// เรียกใช้ฟังก์ชันตรวจสอบตาราง
+ensureStockMovementsTable($pdo);
+
 // ตรวจสอบการกระทำ
 $action = $_GET['action'] ?? 'list';
 $id = $_GET['id'] ?? 0;
@@ -54,7 +94,8 @@ function getReturnItems($pdo, $return_id) {
     try {
         $stmt = $pdo->prepare("
             SELECT ri.*, p.product_name, p.product_code,
-                   ep.product_name as exchange_product_name, ep.product_code as exchange_product_code
+                   ep.product_name as exchange_product_name, 
+                   ep.product_code as exchange_product_code
             FROM return_items ri 
             LEFT JOIN products p ON ri.product_id = p.id 
             LEFT JOIN products ep ON ri.exchange_product_id = ep.id 
@@ -142,13 +183,13 @@ function addReturn($pdo, $data) {
         
         $return_id = $pdo->lastInsertId();
         
-        // บันทึกรายการคืนสินค้า
+        // บันทึกรายการคืนสินค้าและจัดการสต็อก
         foreach ($data['items'] as $item) {
-            // ตรวจสอบข้อมูลรายการ
             if (empty($item['product_id']) || $item['quantity'] <= 0) {
-                continue; // ข้ามรายการที่ไม่ถูกต้อง
+                continue;
             }
 
+            // บันทึกรายการคืน
             $stmt = $pdo->prepare("
                 INSERT INTO return_items 
                 (return_id, product_id, quantity, unit_price, subtotal, reason, action, exchange_product_id) 
@@ -165,33 +206,71 @@ function addReturn($pdo, $data) {
                 !empty($item['exchange_product_id']) ? $item['exchange_product_id'] : null
             ]);
             
-            // เพิ่มจำนวนสินค้าในสต็อกหากเป็นการคืนสินค้า
-            if (($item['action'] ?? 'refund') === 'refund' || ($item['action'] ?? 'refund') === 'store_credit') {
-                $stmt = $pdo->prepare("
-                    UPDATE products 
-                    SET quantity = quantity + ? 
-                    WHERE id = ?
-                ");
-                $stmt->execute([$item['quantity'], $item['product_id']]);
-            }
+            $action = $item['action'] ?? 'refund';
             
-            // ลดจำนวนสินค้าในสต็อกหากเป็นการเปลี่ยนสินค้า
-            if (($item['action'] ?? 'refund') === 'exchange' && !empty($item['exchange_product_id'])) {
-                // ตรวจสอบสต็อกก่อนลด
-                $stmt = $pdo->prepare("SELECT quantity FROM products WHERE id = ?");
-                $stmt->execute([$item['exchange_product_id']]);
-                $current_stock = $stmt->fetchColumn();
+            // จัดการสต็อกตามประเภทการดำเนินการ
+            if ($action === 'refund' || $action === 'store_credit') {
+                // คืนสินค้า - เพิ่มสต็อก
+                $stmt = $pdo->prepare("UPDATE products SET quantity = quantity + ? WHERE id = ?");
+                $stmt->execute([$item['quantity'], $item['product_id']]);
                 
-                if ($current_stock < $item['quantity']) {
-                    throw new Exception('สินค้าที่ต้องการเปลี่ยนมีจำนวนในสต็อกไม่เพียงพอ');
+                // บันทึกประวัติ
+                logStockMovement(
+                    $pdo, 
+                    $item['product_id'], 
+                    'return', 
+                    $item['quantity'], 
+                    "คืนสินค้า: {$data['return_code']} - " . ($item['reason'] ?? 'ไม่ระบุเหตุผล'),
+                    $_SESSION['user_id']
+                );
+                
+            } elseif ($action === 'exchange' && !empty($item['exchange_product_id'])) {
+                // เปลี่ยนสินค้า
+                
+                // 1. เพิ่มสต็อกสินค้าที่คืน (สินค้าเก่า)
+                $stmt = $pdo->prepare("UPDATE products SET quantity = quantity + ? WHERE id = ?");
+                $stmt->execute([$item['quantity'], $item['product_id']]);
+                
+                // บันทึกประวัติ - สินค้าเข้า
+                $stmt = $pdo->prepare("SELECT product_name FROM products WHERE id = ?");
+                $stmt->execute([$item['product_id']]);
+                $old_product = $stmt->fetch();
+                
+                logStockMovement(
+                    $pdo, 
+                    $item['product_id'], 
+                    'exchange_in', 
+                    $item['quantity'], 
+                    "เปลี่ยนสินค้าเข้า: {$data['return_code']} - {$old_product['product_name']}",
+                    $_SESSION['user_id']
+                );
+                
+                // 2. ตรวจสอบสต็อกสินค้าที่จะเปลี่ยนให้ (สินค้าใหม่)
+                $stmt = $pdo->prepare("SELECT product_name, quantity FROM products WHERE id = ?");
+                $stmt->execute([$item['exchange_product_id']]);
+                $new_product = $stmt->fetch();
+                
+                if (!$new_product) {
+                    throw new Exception('ไม่พบสินค้าที่ต้องการเปลี่ยน');
                 }
                 
-                $stmt = $pdo->prepare("
-                    UPDATE products 
-                    SET quantity = quantity - ? 
-                    WHERE id = ?
-                ");
+                if ($new_product['quantity'] < $item['quantity']) {
+                    throw new Exception("สินค้า {$new_product['product_name']} มีในสต็อกเพียง {$new_product['quantity']} ชิ้น ไม่เพียงพอสำหรับการเปลี่ยน");
+                }
+                
+                // 3. ลดสต็อกสินค้าที่เปลี่ยนให้ (สินค้าใหม่)
+                $stmt = $pdo->prepare("UPDATE products SET quantity = quantity - ? WHERE id = ?");
                 $stmt->execute([$item['quantity'], $item['exchange_product_id']]);
+                
+                // บันทึกประวัติ - สินค้าออก
+                logStockMovement(
+                    $pdo, 
+                    $item['exchange_product_id'], 
+                    'exchange_out', 
+                    $item['quantity'], 
+                    "เปลี่ยนสินค้าออก: {$data['return_code']} - แลกจาก {$old_product['product_name']}",
+                    $_SESSION['user_id']
+                );
             }
         }
         
@@ -200,7 +279,7 @@ function addReturn($pdo, $data) {
     } catch (Exception $e) {
         $pdo->rollBack();
         error_log("Error adding return: " . $e->getMessage());
-        throw $e; // ส่ง exception กลับไปเพื่อแสดงข้อความผิดพลาด
+        throw $e;
     }
 }
 
@@ -224,26 +303,51 @@ function deleteReturn($pdo, $id) {
     try {
         // ดึงข้อมูลรายการคืนสินค้าเพื่อคืนสต็อก
         $items = getReturnItems($pdo, $id);
+        $return = getReturn($pdo, $id);
         
         foreach ($items as $item) {
-            // คืนจำนวนสินค้าในสต็อก (ย้อนกลับการดำเนินการ)
+            // ย้อนกลับการดำเนินการสต็อก
             if ($item['action'] === 'refund' || $item['action'] === 'store_credit') {
+                // ลดสต็อกที่เพิ่มไป
                 $stmt = $pdo->prepare("
                     UPDATE products 
                     SET quantity = GREATEST(quantity - ?, 0)
                     WHERE id = ?
                 ");
                 $stmt->execute([$item['quantity'], $item['product_id']]);
-            }
-            
-            // เพิ่มจำนวนสินค้าในสต็อกหากเป็นการเปลี่ยนสินค้า
-            if ($item['action'] === 'exchange' && $item['exchange_product_id']) {
+                
+                logStockMovement(
+                    $pdo, 
+                    $item['product_id'], 
+                    'out', 
+                    $item['quantity'], 
+                    "ยกเลิกการคืนสินค้า: {$return['return_code']}",
+                    $_SESSION['user_id']
+                );
+                
+            } elseif ($item['action'] === 'exchange' && $item['exchange_product_id']) {
+                // ย้อนกลับการเปลี่ยนสินค้า
+                
+                // 1. ลดสต็อกสินค้าเก่าที่เพิ่มไป
                 $stmt = $pdo->prepare("
                     UPDATE products 
-                    SET quantity = quantity + ? 
+                    SET quantity = GREATEST(quantity - ?, 0)
                     WHERE id = ?
                 ");
+                $stmt->execute([$item['quantity'], $item['product_id']]);
+                
+                // 2. เพิ่มสต็อกสินค้าใหม่ที่ลดไป
+                $stmt = $pdo->prepare("UPDATE products SET quantity = quantity + ? WHERE id = ?");
                 $stmt->execute([$item['quantity'], $item['exchange_product_id']]);
+                
+                logStockMovement(
+                    $pdo, 
+                    $item['exchange_product_id'], 
+                    'in', 
+                    $item['quantity'], 
+                    "ยกเลิกการเปลี่ยนสินค้า: {$return['return_code']}",
+                    $_SESSION['user_id']
+                );
             }
         }
         
@@ -265,9 +369,8 @@ function deleteReturn($pdo, $id) {
 }
 
 function generateReturnCode(PDO $pdo): string {
-    // รูปแบบ: RETYYYYMM####  เช่น RET2025090001
-    $prefix = 'RET' . date('Ym');            // RET + ปี(4) + เดือน(2)
-    $start  = strlen($prefix) + 1;           // ตำแหน่งเริ่มของเลขลำดับ (ฐาน 1)
+    $prefix = 'RET' . date('Ym');
+    $start  = strlen($prefix) + 1;
 
     $sql = "
         SELECT MAX(CAST(SUBSTRING(return_code, :start) AS UNSIGNED)) AS max_seq
@@ -299,7 +402,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $form_action = $_POST['action'] ?? 'add';
         $form_id = $_POST['id'] ?? 0;
         
-        // ตรวจสอบข้อมูลพื้นฐาน
         if (empty($return_code)) {
             throw new Exception('กรุณาระบุเลขที่คืนสินค้า');
         }
@@ -345,7 +447,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'reason' => $reason,
             'status' => $status,
             'total_amount' => $total_amount,
-            'refund_amount' => $total_amount, // สามารถปรับลดได้ในอนาคต
+            'refund_amount' => $total_amount,
             'refund_method' => $refund_method,
             'items' => $items
         ];
@@ -353,7 +455,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if ($form_action === 'add') {
             $return_id = addReturn($pdo, $return_data);
             if ($return_id) {
-                $_SESSION['success_message'] = 'บันทึกการคืนสินค้าสำเร็จ';
+                $_SESSION['success_message'] = 'บันทึกการคืนสินค้าสำเร็จ และอัพเดทสต็อกเรียบร้อยแล้ว';
                 header('Location: returns.php?action=view&id=' . $return_id);
                 exit;
             }
@@ -390,7 +492,7 @@ if ($action === 'update_status' && $id > 0) {
 // ลบการคืนสินค้า
 if ($action === 'delete' && $id > 0) {
     if (deleteReturn($pdo, $id)) {
-        $_SESSION['success_message'] = 'ลบการคืนสินค้าสำเร็จ';
+        $_SESSION['success_message'] = 'ลบการคืนสินค้าสำเร็จ และคืนสต็อกเรียบร้อยแล้ว';
     } else {
         $_SESSION['error_message'] = 'เกิดข้อผิดพลาดในการลบการคืนสินค้า';
     }
@@ -425,7 +527,7 @@ $new_return_code = generateReturnCode($pdo);
     <link href="https://fonts.googleapis.com/css2?family=Phetsarath+OT:wght@400;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.5/font/bootstrap-icons.css">
     <link href="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/css/select2.min.css" rel="stylesheet" />
-    <link rel="stylesheet" href="css/style.css">
+    <link rel="stylesheet" href="../css/style.css">
     <style>
         .page-header {
             background: linear-gradient(120deg, #4361ee, #3f37c9);
@@ -435,134 +537,56 @@ $new_return_code = generateReturnCode($pdo);
             border-radius: 0 0 15px 15px;
         }
         .select2-container { width: 100% !important; }
-        .return-card {
-            border-radius: 12px;
-            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.08);
-            transition: transform 0.3s;
-        }
-        
-        .return-card:hover {
-            transform: translateY(-5px);
-        }
-        
-        .return-icon {
-            font-size: 2rem;
-            color: #4361ee;
-            margin-bottom: 1rem;
-        }
-        
-        .action-buttons .btn {
-            margin: 0 3px;
-        }
-        
-        .table-responsive {
-            border-radius: 12px;
-            overflow: hidden;
-            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.08);
-        }
-        
-        #returnsTable th {
-            background-color: #f8f9fa;
-            font-weight: 600;
-        }
-        
-        .btn-delete {
-            transition: all 0.3s;
-        }
-        
-        .btn-delete:hover {
-            transform: scale(1.05);
-            box-shadow: 0 0 10px rgba(220, 53, 69, 0.3);
-        }
-        
-        .badge-status {
-            font-size: 0.75rem;
-            padding: 0.35em 0.65em;
-        }
-        
-        .return-items-table th {
-            background-color: #f8f9fa;
-        }
-        
-        .item-row {
-            transition: background-color 0.2s;
-        }
-        
-        .item-row:hover {
-            background-color: #f8f9fa;
-        }
-        
-        .total-row {
-            background-color: #e9ecef;
-            font-weight: bold;
-        }
-        
-        .status-badge {
-            font-size: 0.8rem;
-        }
-        
-        .status-pending {
-            background-color: #ffc107;
-            color: #000;
-        }
-        
-        .status-approved {
-            background-color: #198754;
-        }
-        
-        .status-rejected {
-            background-color: #dc3545;
-        }
-        
-        .status-completed {
-            background-color: #0d6efd;
-        }
-        
-        .action-badge {
-            font-size: 0.7rem;
-        }
-        
-        .action-refund {
-            background-color: #6f42c1;
-        }
-        
-        .action-exchange {
-            background-color: #fd7e14;
-        }
-        
-        .action-store_credit {
-            background-color: #20c997;
-        }
         
         .exchange-product-info {
             border-left: 3px solid #0d6efd;
-            font-size: 0.8rem;
-        }
-        
-        .product-details div {
-            margin-bottom: 2px;
-        }
-        
-        .suggestion-item {
-            padding: 8px 12px;
-            cursor: pointer;
-            border-bottom: 1px solid #eee;
-            transition: background-color 0.2s;
-        }
-        
-        .suggestion-item:hover {
             background-color: #f8f9fa;
+            font-size: 0.85rem;
+            padding: 10px;
+            margin-top: 10px;
+            border-radius: 5px;
         }
         
-        .product-suggestions, .exchange-product-suggestions {
-            position: absolute;
-            background: white;
-            border: 1px solid #ddd;
-            max-height: 200px;
-            overflow-y: auto;
-            z-index: 1000;
-            width: 100%;
-            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        .exchange-product-info .info-label {
+            font-weight: 600;
+            color: #495057;
+        }
+        
+        .exchange-product-info .info-value {
+            color: #0d6efd;
+            font-weight: 500;
+        }
+        
+        .stock-alert {
+            background-color: #fff3cd;
+            border: 1px solid #ffc107;
+            padding: 8px;
+            border-radius: 5px;
+            margin-top: 5px;
+        }
+        
+        .stock-ok {
+            background-color: #d1e7dd;
+            border: 1px solid #198754;
+        }
+        
+        .action-badge {
+            font-size: 0.75rem;
+            padding: 0.25rem 0.5rem;
+        }
+        
+        .return-summary-card {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 1.5rem;
+            border-radius: 10px;
+            margin-bottom: 1rem;
+        }
+        
+        .stock-movement-badge {
+            font-size: 0.7rem;
+            padding: 0.3rem 0.6rem;
+            border-radius: 12px;
         }
     </style>
 </head>
@@ -570,834 +594,464 @@ $new_return_code = generateReturnCode($pdo);
     <?php include '../includes/header.php'; ?>
     
     <div class="container-fluid">
-        <div class="row">
+        <?php if ($action === 'view' && isset($return)): ?>
+            <!-- แสดงรายละเอียดการคืนสินค้า -->
+            <div class="page-header">
+                <div class="container">
+                    <h1 class="h2 mb-0">
+                        <i class="bi bi-arrow-return-left me-2"></i>
+                        รายละเอียดการคืนสินค้า #<?php echo $return['return_code']; ?>
+                    </h1>
+                </div>
+            </div>
             
-            <main class="">
-                <!-- ส่วนหัวหน้า -->
-                <div class="page-header">
-                    <div class="container">
-                        <div class="row align-items-center">
-                            <div class="col-md-6">
-                                <h1 class="h2 mb-0"><i class="bi bi-arrow-return-left me-2"></i> จัดการการคืนสินค้า</h1>
-                                <p class="mb-0">จัดการรายการคืนสินค้าและเปลี่ยนสินค้า</p>
-                            </div>
-                            <div class="col-md-6 text-md-end">
-                                <button class="btn btn-light" data-bs-toggle="modal" data-bs-target="#returnModal" data-action="add">
-                                    <i class="bi bi-plus-circle me-1"></i> คืนสินค้า
-                                </button>
-                            </div>
+            <div class="container">
+                <?php if (isset($_SESSION['success_message'])): ?>
+                    <div class="alert alert-success alert-dismissible fade show">
+                        <i class="bi bi-check-circle me-2"></i><?php echo $_SESSION['success_message']; ?>
+                        <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+                    </div>
+                    <?php unset($_SESSION['success_message']); ?>
+                <?php endif; ?>
+                
+                <div class="return-summary-card">
+                    <div class="row">
+                        <div class="col-md-6">
+                            <h5><i class="bi bi-person me-2"></i><?php echo $return['customer_name']; ?></h5>
+                            <p class="mb-1"><i class="bi bi-telephone me-2"></i><?php echo $return['customer_phone'] ?? '-'; ?></p>
+                            <p class="mb-0"><i class="bi bi-receipt me-2"></i>ใบขาย: <?php echo $return['sale_code']; ?></p>
+                        </div>
+                        <div class="col-md-6 text-end">
+                            <h5><i class="bi bi-calendar me-2"></i><?php echo date('d/m/Y H:i', strtotime($return['return_date'])); ?></h5>
+                            <p class="mb-1"><i class="bi bi-person-badge me-2"></i><?php echo $return['created_by_name']; ?></p>
+                            <p class="mb-0">
+                                <span class="badge bg-light text-dark">
+                                    <?php echo $return['return_type'] === 'return' ? 'คืนสินค้า' : 'เปลี่ยนสินค้า'; ?>
+                                </span>
+                            </p>
                         </div>
                     </div>
                 </div>
                 
-                <div class="container">
-                    <!-- แสดงข้อความแจ้งเตือน -->
-                    <?php if (isset($_SESSION['success_message'])): ?>
-                        <div class="alert alert-success alert-dismissible fade show" role="alert">
-                            <i class="bi bi-check-circle me-2"></i> <?php echo $_SESSION['success_message']; ?>
-                            <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
-                        </div>
-                        <?php unset($_SESSION['success_message']); ?>
-                    <?php endif; ?>
-                    
-                    <?php if (isset($_SESSION['error_message'])): ?>
-                        <div class="alert alert-danger alert-dismissible fade show" role="alert">
-                            <i class="bi bi-exclamation-triangle me-2"></i> <?php echo $_SESSION['error_message']; ?>
-                            <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
-                        </div>
-                        <?php unset($_SESSION['error_message']); ?>
-                    <?php endif; ?>
-                    
-                    <?php if ($action === 'view' && isset($return)): ?>
-                        <!-- แสดงรายละเอียดการคืนสินค้า -->
-                        <div class="card mb-4">
-                            <div class="card-header bg-white d-flex justify-content-between align-items-center">
-                                <h5 class="card-title mb-0">
-                                    <i class="bi bi-arrow-return-left me-2"></i>รายละเอียดการคืนสินค้า #<?php echo $return['return_code']; ?>
-                                </h5>
-                                <div>
-                                    <span class="badge status-badge status-<?php echo $return['status']; ?>">
-                                        <?php 
-                                        $status_labels = [
-                                            'pending' => 'รอดำเนินการ',
-                                            'approved' => 'อนุมัติแล้ว',
-                                            'rejected' => 'ปฏิเสธ',
-                                            'completed' => 'เสร็จสิ้น'
-                                        ];
-                                        echo $status_labels[$return['status']] ?? $return['status'];
-                                        ?>
-                                    </span>
-                                </div>
-                            </div>
-                            <div class="card-body">
-                                <div class="row mb-4">
-                                    <div class="col-md-6">
-                                        <p><strong>ลูกค้า:</strong> <?php echo $return['customer_name']; ?></p>
-                                        <p><strong>โทรศัพท์:</strong> <?php echo $return['customer_phone'] ?? '-'; ?></p>
-                                        <p><strong>การขายที่เกี่ยวข้อง:</strong> <?php echo $return['sale_code']; ?></p>
-                                    </div>
-                                    <div class="col-md-6">
-                                        <p><strong>ประเภท:</strong> 
-                                            <?php echo $return['return_type'] === 'return' ? 'คืนสินค้า' : 'เปลี่ยนสินค้า'; ?>
-                                        </p>
-                                        <p><strong>วันที่คืน:</strong> <?php echo date('d/m/Y H:i', strtotime($return['return_date'])); ?></p>
-                                        <p><strong>พนักงาน:</strong> <?php echo $return['created_by_name']; ?></p>
-                                    </div>
-                                </div>
-                                
-                                <?php if (!empty($return['reason'])): ?>
-                                    <div class="alert alert-info mb-4">
-                                        <strong>เหตุผล:</strong> <?php echo htmlspecialchars($return['reason']); ?>
-                                    </div>
-                                <?php endif; ?>
-                                
-                                <div class="table-responsive mb-4">
-                                    <table class="table table-bordered return-items-table">
-                                        <thead>
-                                            <tr>
-                                                <th width="5%">#</th>
-                                                <th width="35%">สินค้า</th>
-                                                <th width="10%">จำนวน</th>
-                                                <th width="15%">ราคาต่อหน่วย</th>
-                                                <th width="15%">รวม</th>
-                                                <th width="20%">การดำเนินการ</th>
-                                            </tr>
-                                        </thead>
-                                        <tbody>
-                                            <?php $total = 0; ?>
-                                            <?php foreach ($return_items as $index => $item): ?>
-                                                <tr class="item-row">
-                                                    <td><?php echo $index + 1; ?></td>
-                                                    <td>
-                                                        <?php echo htmlspecialchars($item['product_name']); ?>
-                                                        <br>
-                                                        <small class="text-muted"><?php echo htmlspecialchars($item['product_code']); ?></small>
-                                                        <?php if (!empty($item['reason'])): ?>
-                                                            <br>
-                                                            <small class="text-muted">เหตุผล: <?php echo htmlspecialchars($item['reason']); ?></small>
-                                                        <?php endif; ?>
-                                                    </td>
-                                                    <td><?php echo number_format($item['quantity']); ?></td>
-                                                    <td>฿<?php echo number_format($item['unit_price'], 2); ?></td>
-                                                    <td>฿<?php echo number_format($item['subtotal'], 2); ?></td>
-                                                    <td>
-                                                        <span class="badge action-badge action-<?php echo $item['action']; ?>">
-                                                            <?php 
-                                                            $action_labels = [
-                                                                'refund' => 'คืนเงิน',
-                                                                'exchange' => 'เปลี่ยนสินค้า',
-                                                                'store_credit' => 'เครดิตร้าน'
-                                                            ];
-                                                            echo $action_labels[$item['action']] ?? $item['action'];
-                                                            ?>
-                                                        </span>
-                                                        <?php if ($item['action'] === 'exchange' && $item['exchange_product_id']): ?>
-                                                            <br>
-                                                            <small class="text-muted">
-                                                                เปลี่ยนเป็น: <?php echo htmlspecialchars($item['exchange_product_name']); ?>
-                                                            </small>
-                                                        <?php endif; ?>
-                                                    </td>
-                                                </tr>
-                                                <?php $total += $item['subtotal']; ?>
-                                            <?php endforeach; ?>
-                                            <tr class="total-row">
-                                                <td colspan="4" class="text-end"><strong>รวมทั้งสิ้น:</strong></td>
-                                                <td><strong>฿<?php echo number_format($total, 2); ?></strong></td>
-                                                <td></td>
-                                            </tr>
-                                            <?php if ($return['return_type'] === 'return'): ?>
-                                                <tr class="total-row">
-                                                    <td colspan="4" class="text-end"><strong>ยอดคืน:</strong></td>
-                                                    <td><strong>฿<?php echo number_format($return['refund_amount'], 2); ?></strong></td>
-                                                    <td>
-                                                        <strong>วิธีคืน:</strong> 
-                                                        <?php 
-                                                        $refund_methods = [
-                                                            'cash' => 'เงินสด',
-                                                            'transfer' => 'โอนเงิน',
-                                                            'credit' => 'บัตรเครดิต'
-                                                        ];
-                                                        echo $refund_methods[$return['refund_method']] ?? $return['refund_method'];
-                                                        ?>
-                                                    </td>
-                                                </tr>
+                <?php if (!empty($return['reason'])): ?>
+                    <div class="alert alert-info">
+                        <strong><i class="bi bi-info-circle me-2"></i>เหตุผล:</strong> <?php echo htmlspecialchars($return['reason']); ?>
+                    </div>
+                <?php endif; ?>
+                
+                <div class="card">
+                    <div class="card-body">
+                        <table class="table">
+                            <thead>
+                                <tr>
+                                    <th width="15%">ราคา</th>
+                                    <th width="15%">การดำเนินการ</th>
+                                    <th width="25%">สินค้าที่เปลี่ยน</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <?php $total = 0; ?>
+                                <?php foreach ($return_items as $index => $item): ?>
+                                    <tr>
+                                        <td><?php echo $index + 1; ?></td>
+                                        <td>
+                                            <strong><?php echo htmlspecialchars($item['product_name']); ?></strong>
+                                            <br><small class="text-muted">รหัส: <?php echo htmlspecialchars($item['product_code']); ?></small>
+                                            <?php if (!empty($item['reason'])): ?>
+                                                <br><small class="text-info">เหตุผล: <?php echo htmlspecialchars($item['reason']); ?></small>
                                             <?php endif; ?>
-                                        </tbody>
-                                    </table>
-                                </div>
-                                
-                                <div class="d-flex justify-content-between align-items-center">
-                                    <div>
-                                        <a href="returns.php" class="btn btn-secondary me-2">
-                                            <i class="bi bi-arrow-left me-1"></i> กลับ
-                                        </a>
-                                        <?php if ($return['status'] === 'pending'): ?>
-                                            <button class="btn btn-success me-2" onclick="updateStatus(<?php echo $return['id']; ?>, 'approved')">
-                                                <i class="bi bi-check-circle me-1"></i> อนุมัติ
-                                            </button>
-                                            <button class="btn btn-danger me-2" onclick="updateStatus(<?php echo $return['id']; ?>, 'rejected')">
-                                                <i class="bi bi-x-circle me-1"></i> ปฏิเสธ
-                                            </button>
-                                        <?php elseif ($return['status'] === 'approved'): ?>
-                                            <button class="btn btn-primary" onclick="updateStatus(<?php echo $return['id']; ?>, 'completed')">
-                                                <i class="bi bi-check-all me-1"></i> ทำเครื่องหมายว่าเสร็จสิ้น
-                                            </button>
-                                        <?php endif; ?>
-                                    </div>
-                                    
-                                    <?php if ($return['status'] === 'pending'): ?>
-                                        <button class="btn btn-outline-danger btn-delete" 
-                                                data-id="<?php echo $return['id']; ?>"
-                                                data-code="<?php echo htmlspecialchars($return['return_code']); ?>">
-                                            <i class="bi bi-trash me-1"></i> ลบ
-                                        </button>
-                                    <?php endif; ?>
-                                </div>
-                            </div>
-                        </div>
-                    <?php else: ?>
-                        <!-- การ์ดแสดงสถิติ -->
-                        <div class="row mb-4">
-                            <div class="col-md-3">
-                                <div class="card return-card text-center p-4">
-                                    <div class="return-icon">
-                                        <i class="bi bi-arrow-return-left"></i>
-                                    </div>
-                                    <h3><?php echo count($returns); ?></h3>
-                                    <p class="text-muted mb-0">การคืนสินค้าทั้งหมด</p>
-                                </div>
-                            </div>
-                            <div class="col-md-3">
-                                <div class="card return-card text-center p-4">
-                                    <div class="return-icon text-warning">
-                                        <i class="bi bi-clock-history"></i>
-                                    </div>
-                                    <h3><?php 
-                                        $pending_count = array_filter($returns, function($r) { 
-                                            return $r['status'] === 'pending'; 
-                                        });
-                                        echo count($pending_count);
-                                    ?></h3>
-                                    <p class="text-muted mb-0">รอดำเนินการ</p>
-                                </div>
-                            </div>
-                            <div class="col-md-3">
-                                <div class="card return-card text-center p-4">
-                                    <div class="return-icon text-success">
-                                        <i class="bi bi-currency-exchange"></i>
-                                    </div>
-                                    <h3>฿<?php 
-                                        $total_refunds = array_sum(array_column($returns, 'refund_amount'));
-                                        echo number_format($total_refunds); 
-                                    ?></h3>
-                                    <p class="text-muted mb-0">ยอดคืนรวม</p>
-                                </div>
-                            </div>
-                            <div class="col-md-3">
-                                <div class="card return-card text-center p-4">
-                                    <div class="return-icon text-info">
-                                        <i class="bi bi-arrow-left-right"></i>
-                                    </div>
-                                    <h3><?php 
-                                        $exchange_count = array_filter($returns, function($r) { 
-                                            return $r['return_type'] === 'exchange'; 
-                                        });
-                                        echo count($exchange_count);
-                                    ?></h3>
-                                    <p class="text-muted mb-0">การเปลี่ยนสินค้า</p>
-                                </div>
-                            </div>
-                        </div>
-                        
-                        <!-- ตารางการคืนสินค้า -->
-                        <div class="card">
-                            <div class="card-header bg-white">
-                                <h5 class="card-title mb-0">รายการคืนสินค้า</h5>
-                            </div>
-                            <div class="card-body">
-                                <div class="table-responsive">
-                                    <table id="returnsTable" class="table table-hover">
-                                        <thead class="table-light">
-                                            <tr>
-                                                <th width="5%">#</th>
-                                                <th width="15%">เลขที่คืน</th>
-                                                <th width="20%">ลูกค้า</th>
-                                                <th width="15%">วันที่คืน</th>
-                                                <th width="15%">ประเภท</th>
-                                                <th width="15%">ยอดคืน</th>
-                                                <th width="15%">สถานะ</th>
-                                                <th width="15%">การดำเนินการ</th>
-                                            </tr>
-                                        </thead>
-                                        <tbody>
-                                            <?php if (count($returns) > 0): ?>
-                                                <?php foreach ($returns as $index => $ret): ?>
-                                                    <tr>
-                                                        <td><?php echo $index + 1; ?></td>
-                                                        <td>
-                                                            <span class="badge bg-primary"><?php echo htmlspecialchars($ret['return_code']); ?></span>
-                                                        </td>
-                                                        <td><?php echo htmlspecialchars($ret['customer_name']); ?></td>
-                                                        <td><?php echo date('d/m/Y H:i', strtotime($ret['return_date'])); ?></td>
-                                                        <td>
-                                                            <?php echo $ret['return_type'] === 'return' ? 'คืนสินค้า' : 'เปลี่ยนสินค้า'; ?>
-                                                        </td>
-                                                        <td>฿<?php echo number_format($ret['refund_amount'], 2); ?></td>
-                                                        <td>
-                                                            <span class="badge status-badge status-<?php echo $ret['status']; ?>">
-                                                                <?php 
-                                                                $status_labels = [
-                                                                    'pending' => 'รอดำเนินการ',
-                                                                    'approved' => 'อนุมัติแล้ว',
-                                                                    'rejected' => 'ปฏิเสธ',
-                                                                    'completed' => 'เสร็จสิ้น'
-                                                                ];
-                                                                echo $status_labels[$ret['status']] ?? $ret['status'];
-                                                                ?>
-                                                            </span>
-                                                        </td>
-                                                        <td class="action-buttons">
-                                                            <a href="returns.php?action=view&id=<?php echo $ret['id']; ?>" class="btn btn-sm btn-outline-info">
-                                                                <i class="bi bi-eye"></i> ดู
-                                                            </a>
-                                                            <?php if ($ret['status'] === 'pending'): ?>
-                                                                <button class="btn btn-sm btn-outline-danger btn-delete" 
-                                                                        data-id="<?php echo $ret['id']; ?>"
-                                                                        data-code="<?php echo htmlspecialchars($ret['return_code']); ?>">
-                                                                    <i class="bi bi-trash"></i> ลบ
-                                                                </button>
-                                                            <?php endif; ?>
-                                                        </td>
-                                                    </tr>
-                                                <?php endforeach; ?>
+                                        </td>
+                                        <td><strong><?php echo number_format($item['quantity']); ?></strong></td>
+                                        <td>฿<?php echo number_format($item['subtotal'], 2); ?></td>
+                                        <td>
+                                            <?php
+                                            $action_labels = [
+                                                'refund' => ['คืนเงิน', 'bg-success'],
+                                                'exchange' => ['เปลี่ยนสินค้า', 'bg-primary'],
+                                                'store_credit' => ['เครดิตร้าน', 'bg-info']
+                                            ];
+                                            $action_info = $action_labels[$item['action']] ?? [$item['action'], 'bg-secondary'];
+                                            ?>
+                                            <span class="badge <?php echo $action_info[1]; ?> action-badge">
+                                                <?php echo $action_info[0]; ?>
+                                            </span>
+                                            <br>
+                                            <small class="stock-movement-badge bg-success text-white mt-1 d-inline-block">
+                                                <i class="bi bi-arrow-up"></i> สต็อก +<?php echo $item['quantity']; ?>
+                                            </small>
+                                        </td>
+                                        <td>
+                                            <?php if ($item['action'] === 'exchange' && $item['exchange_product_id']): ?>
+                                                <div class="exchange-product-info">
+                                                    <div><span class="info-label">สินค้า:</span> <span class="info-value"><?php echo htmlspecialchars($item['exchange_product_name']); ?></span></div>
+                                                    <div><span class="info-label">รหัส:</span> <span class="info-value"><?php echo htmlspecialchars($item['exchange_product_code']); ?></span></div>
+                                                    <small class="stock-movement-badge bg-danger text-white mt-1 d-inline-block">
+                                                        <i class="bi bi-arrow-down"></i> สต็อก -<?php echo $item['quantity']; ?>
+                                                    </small>
+                                                </div>
                                             <?php else: ?>
-                                                <tr>
-                                                    <td colspan="8" class="text-center py-4 text-muted">
-                                                        <i class="bi bi-inbox display-4 d-block mb-2"></i>
-                                                        ยังไม่มีรายการคืนสินค้า
-                                                    </td>
-                                                </tr>
+                                                <span class="text-muted">-</span>
                                             <?php endif; ?>
-                                        </tbody>
-                                    </table>
+                                        </td>
+                                    </tr>
+                                    <?php $total += $item['subtotal']; ?>
+                                <?php endforeach; ?>
+                            </tbody>
+                            <tfoot>
+                                <tr class="table-light">
+                                    <td colspan="3" class="text-end"><strong>รวม:</strong></td>
+                                    <td colspan="3"><strong>฿<?php echo number_format($total, 2); ?></strong></td>
+                                </tr>
+                            </tfoot>
+                        </table>
+                        
+                        <div class="d-flex justify-content-between mt-4">
+                            <a href="returns.php" class="btn btn-secondary">
+                                <i class="bi bi-arrow-left me-1"></i> กลับ
+                            </a>
+                            <?php if ($return['status'] === 'pending'): ?>
+                                <div>
+                                    <button class="btn btn-success me-2" onclick="updateStatus(<?php echo $return['id']; ?>, 'approved')">
+                                        <i class="bi bi-check-circle me-1"></i> อนุมัติ
+                                    </button>
+                                    <button class="btn btn-danger me-2" onclick="updateStatus(<?php echo $return['id']; ?>, 'rejected')">
+                                        <i class="bi bi-x-circle me-1"></i> ปฏิเสธ
+                                    </button>
+                                    <button class="btn btn-outline-danger" onclick="confirmDelete(<?php echo $return['id']; ?>, '<?php echo htmlspecialchars($return['return_code']); ?>')">
+                                        <i class="bi bi-trash me-1"></i> ลบ
+                                    </button>
                                 </div>
-                            </div>
+                            <?php endif; ?>
                         </div>
-                    <?php endif; ?>
+                    </div>
                 </div>
-            </main>
-        </div>
+            </div>
+        <?php else: ?>
+            <!-- หน้ารายการคืนสินค้า -->
+            <div class="page-header">
+                <div class="container">
+                    <div class="row align-items-center">
+                        <div class="col-md-6">
+                            <h1 class="h2 mb-0"><i class="bi bi-arrow-return-left me-2"></i>จัดการการคืนสินค้า</h1>
+                        </div>
+                        <div class="col-md-6 text-md-end">
+                            <button class="btn btn-light" data-bs-toggle="modal" data-bs-target="#returnModal">
+                                <i class="bi bi-plus-circle me-1"></i> คืนสินค้า
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="container">
+                <?php if (isset($_SESSION['success_message'])): ?>
+                    <div class="alert alert-success alert-dismissible fade show">
+                        <i class="bi bi-check-circle me-2"></i><?php echo $_SESSION['success_message']; ?>
+                        <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+                    </div>
+                    <?php unset($_SESSION['success_message']); ?>
+                <?php endif; ?>
+                
+                <?php if (isset($_SESSION['error_message'])): ?>
+                    <div class="alert alert-danger alert-dismissible fade show">
+                        <i class="bi bi-exclamation-triangle me-2"></i><?php echo $_SESSION['error_message']; ?>
+                        <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+                    </div>
+                    <?php unset($_SESSION['error_message']); ?>
+                <?php endif; ?>
+                
+                <div class="card">
+                    <div class="card-body">
+                        <table id="returnsTable" class="table table-hover">
+                            <thead>
+                                <tr>
+                                    <th>#</th>
+                                    <th>เลขที่คืน</th>
+                                    <th>ลูกค้า</th>
+                                    <th>วันที่</th>
+                                    <th>ประเภท</th>
+                                    <th>ยอดเงิน</th>
+                                    <th>สถานะ</th>
+                                    <th>การดำเนินการ</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <?php foreach ($returns as $index => $ret): ?>
+                                    <tr>
+                                        <td><?php echo $index + 1; ?></td>
+                                        <td><span class="badge bg-primary"><?php echo $ret['return_code']; ?></span></td>
+                                        <td><?php echo htmlspecialchars($ret['customer_name']); ?></td>
+                                        <td><?php echo date('d/m/Y', strtotime($ret['return_date'])); ?></td>
+                                        <td><?php echo $ret['return_type'] === 'return' ? 'คืนสินค้า' : 'เปลี่ยนสินค้า'; ?></td>
+                                        <td>฿<?php echo number_format($ret['refund_amount'], 2); ?></td>
+                                        <td>
+                                            <?php
+                                            $status_colors = [
+                                                'pending' => 'warning',
+                                                'approved' => 'primary',
+                                                'completed' => 'success',
+                                                'rejected' => 'danger'
+                                            ];
+                                            $status_labels = [
+                                                'pending' => 'รอดำเนินการ',
+                                                'approved' => 'อนุมัติแล้ว',
+                                                'completed' => 'เสร็จสิ้น',
+                                                'rejected' => 'ปฏิเสธ'
+                                            ];
+                                            ?>
+                                            <span class="badge bg-<?php echo $status_colors[$ret['status']] ?? 'secondary'; ?>">
+                                                <?php echo $status_labels[$ret['status']] ?? $ret['status']; ?>
+                                            </span>
+                                        </td>
+                                        <td>
+                                            <a href="returns.php?action=view&id=<?php echo $ret['id']; ?>" class="btn btn-sm btn-outline-info">
+                                                <i class="bi bi-eye"></i>
+                                            </a>
+                                            <?php if ($ret['status'] === 'pending'): ?>
+                                                <button class="btn btn-sm btn-outline-danger" onclick="confirmDelete(<?php echo $ret['id']; ?>, '<?php echo htmlspecialchars($ret['return_code']); ?>')">
+                                                    <i class="bi bi-trash"></i>
+                                                </button>
+                                            <?php endif; ?>
+                                        </td>
+                                    </tr>
+                                <?php endforeach; ?>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        <?php endif; ?>
     </div>
-    
-    <!-- Modal สำหรับเพิ่ม/แก้ไขการคืนสินค้า -->
-    <div class="modal fade" id="returnModal" tabindex="-1" aria-labelledby="returnModalLabel" aria-hidden="true">
+
+    <!-- Modal เพิ่มการคืนสินค้า -->
+    <div class="modal fade" id="returnModal" tabindex="-1">
         <div class="modal-dialog modal-xl">
             <div class="modal-content">
                 <div class="modal-header">
-                    <h5 class="modal-title" id="returnModalLabel">เพิ่มการคืนสินค้า</h5>
-                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                    <h5 class="modal-title">คืนสินค้า / เปลี่ยนสินค้า</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
                 </div>
-                <form id="returnForm" method="post" action="returns.php">
+                <form method="post">
                     <input type="hidden" name="action" value="add">
-                    <input type="hidden" name="id" value="0">
+                    <input type="hidden" name="return_code" value="<?php echo $new_return_code; ?>">
                     
                     <div class="modal-body">
-                        <div class="row mb-4">
-                            <div class="col-md-6">
-                                <div class="mb-3">
-                                    <label for="return_code" class="form-label">เลขที่คืนสินค้า</label>
-                                    <input type="text" class="form-control" id="return_code" name="return_code" value="<?php echo $new_return_code; ?>" readonly>
-                                </div>
-                            </div>
-                            <div class="col-md-6">
-                                <div class="mb-3">
-                                    <label for="return_date" class="form-label">วันที่คืน</label>
-                                    <input type="datetime-local" class="form-control" id="return_date" name="return_date" value="<?php echo date('Y-m-d\TH:i'); ?>" required>
-                                </div>
-                            </div>
+                        <div class="alert alert-info">
+                            <i class="bi bi-info-circle me-2"></i>
+                            <strong>เลขที่คืนสินค้า:</strong> <?php echo $new_return_code; ?>
                         </div>
                         
-                        <div class="row mb-4">
+                        <div class="row mb-3">
                             <div class="col-md-6">
-                                <div class="mb-3">
-                                    <label for="sale_id" class="form-label">การขายที่เกี่ยวข้อง</label>
-                                    <input type="text" class="form-control" id="sale_id" name="sale_id" required>
-                                    <div class="form-text">พิมพ์ค้นหาเลขที่ขายหรือชื่อลูกค้า (อย่างน้อย 2 ตัวอักษร)</div>
-
-                                </div>
+                                <label class="form-label">การขายที่เกี่ยวข้อง</label>
+                                <select name="sale_id" id="saleSelect" class="form-select">
+                                    <option value="">เลือกใบขาย</option>
+                                    <?php foreach ($sales as $sale): ?>
+                                        <option value="<?php echo $sale['id']; ?>" 
+                                                data-customer="<?php echo $sale['customer_id']; ?>"
+                                                data-customer-name="<?php echo htmlspecialchars($sale['customer_name']); ?>">
+                                            <?php echo $sale['sale_code']; ?> - <?php echo htmlspecialchars($sale['customer_name']); ?>
+                                        </option>
+                                    <?php endforeach; ?>
+                                </select>
                             </div>
                             <div class="col-md-6">
-                                <div class="mb-3">
-                                    <label for="customer_id" class="form-label">ลูกค้า</label>
-                                    <input type="hidden" id="customer_id" name="customer_id">
-                                    <input type="text" class="form-control" id="customer_name" readonly>
-                                </div>
-                            </div>
-                        </div>
-                        
-                        <div class="row mb-4">
-                            <div class="col-md-6">
-                                <div class="mb-3">
-                                    <label for="return_type" class="form-label">ประเภท</label>
-                                    <select class="form-select" id="return_type" name="return_type" required>
-                                        <option value="return">คืนสินค้า</option>
-                                        <option value="exchange">เปลี่ยนสินค้า</option>
-                                    </select>
-                                </div>
-                            </div>
-                            <div class="col-md-6">
-                                <div class="mb-3">
-                                    <label for="refund_method" class="form-label">วิธีคืนเงิน</label>
-                                    <select class="form-select" id="refund_method" name="refund_method">
-                                        <option value="cash">เงินสด</option>
-                                        <option value="transfer">โอนเงิน</option>
-                                        <option value="credit">บัตรเครดิต</option>
-                                    </select>
-                                </div>
+                                <label class="form-label">วิธีคืนเงิน</label>
+                                <select name="refund_method" class="form-select">
+                                    <option value="cash">เงินสด</option>
+                                    <option value="transfer">โอนเงิน</option>
+                                    <option value="credit">เครดิต</option>
+                                </select>
+                                <input type="hidden" name="customer_id" id="customerId">
                             </div>
                         </div>
                         
                         <div class="mb-3">
-                            <label for="reason" class="form-label">เหตุผล</label>
-                            <textarea class="form-control" id="reason" name="reason" rows="3"></textarea>
+                            <label class="form-label">เหตุผล</label>
+                            <textarea name="reason" class="form-control" rows="2"></textarea>
                         </div>
                         
-                        <hr>
+                        <h6 class="mb-3">รายการสินค้า</h6>
+                        <table class="table" id="itemsTable">
+                            <thead>
+                                <tr>
+                                    <th width="25%">สินค้าที่คืน</th>
+                                    <th width="10%">จำนวน</th>
+                                    <th width="12%">ราคา</th>
+                                    <th width="15%">การดำเนินการ</th>
+                                    <th width="25%">สินค้าที่เปลี่ยน (ระบุรหัส)</th>
+                                    <th width="8%">เหตุผล</th>
+                                    <th width="5%"></th>
+                                </tr>
+                            </thead>
+                            <tbody id="itemsBody"></tbody>
+                        </table>
                         
-                        <h5 class="mb-3">รายการสินค้า</h5>
-                        <div class="table-responsive mb-3">
-                            <table class="table table-bordered" id="itemsTable">
-                                <thead>
-                                    <tr>
-                                        <th width="30%">สินค้า</th>
-                                        <th width="10%">จำนวน</th>
-                                        <th width="15%">ราคาต่อหน่วย</th>
-                                        <th width="15%">รวม</th>
-                                        <th width="15%">การดำเนินการ</th>
-                                        <th width="15%">สินค้าที่ต้องการเปลี่ยน</th>
-                                        <th width="10%">เหตุผล</th>
-                                        <th width="5%"></th>
-                                    </tr>
-                                </thead>
-                                <tbody id="itemsBody">
-                                    <!-- รายการจะถูกเพิ่มโดย JavaScript -->
-                                </tbody>
-                                <tfoot>
-                                    <tr>
-                                        <td colspan="8" class="text-center">
-                                            <button type="button" class="btn btn-sm btn-outline-primary" id="addItemBtn">
-                                                <i class="bi bi-plus-circle me-1"></i> เพิ่มสินค้า
-                                            </button>
-                                        </td>
-                                    </tr>
-                                </tfoot>
-                            </table>
-                        </div>
-                        
-                        <div class="row">
-                            <div class="col-md-6">
-                                <div class="mb-3">
-                                    <label for="status" class="form-label">สถานะ</label>
-                                    <select class="form-select" id="status" name="status" required>
-                                        <option value="pending">รอดำเนินการ</option>
-                                        <option value="approved">อนุมัติแล้ว</option>
-                                        <option value="rejected">ปฏิเสธ</option>
-                                        <option value="completed">เสร็จสิ้น</option>
-                                    </select>
-                                </div>
-                            </div>
-                            <div class="col-md-6">
-                                <div class="mb-3">
-                                    <label class="form-label">ยอดรวม</label>
-                                    <h3 id="totalAmount">฿0.00</h3>
-                                    <input type="hidden" id="total_amount" name="total_amount" value="0">
-                                    <input type="hidden" id="refund_amount" name="refund_amount" value="0">
-                                </div>
-                            </div>
-                        </div>
+                        <button type="button" class="btn btn-sm btn-primary" onclick="addItemRow()">
+                            <i class="bi bi-plus"></i> เพิ่มรายการ
+                        </button>
                     </div>
+                    
                     <div class="modal-footer">
-                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">ยกเลิก</button>
+                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">ปิด</button>
                         <button type="submit" class="btn btn-primary">บันทึก</button>
                     </div>
                 </form>
             </div>
         </div>
     </div>
-    
-    <!-- Modal ยืนยันการลบ -->
-    <div class="modal fade" id="deleteConfirmModal" tabindex="-1" aria-labelledby="deleteConfirmModalLabel" aria-hidden="true">
-        <div class="modal-dialog">
-            <div class="modal-content">
-                <div class="modal-header">
-                    <h5 class="modal-title" id="deleteConfirmModalLabel">ยืนยันการลบ</h5>
-                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
-                </div>
-                <div class="modal-body">
-                    <p>คุณแน่ใจว่าต้องการลบการคืนสินค้า <strong id="deleteReturnCode"></strong> ใช่หรือไม่?</p>
-                    <p class="text-danger">การกระทำนี้ไม่สามารถย้อนกลับได้</p>
-                </div>
-                <div class="modal-footer">
-                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">ยกเลิก</button>
-                    <a href="#" id="confirmDeleteBtn" class="btn btn-danger">ลบ</a>
-                </div>
-            </div>
-        </div>
-    </div>
+
+    <?php include '../includes/footer.php'; ?>
     
     <script src="https://code.jquery.com/jquery-3.7.0.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
     <script src="https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js"></script>
     <script src="https://cdn.datatables.net/1.13.6/js/dataTables.bootstrap5.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/js/select2.min.js"></script>
-
+    <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
     
     <script>
         $(document).ready(function() {
-            // เปิด modal เมื่อคลิกปุ่มเพิ่ม
-            $('[data-bs-target="#returnModal"]').click(function() {
-                $('#returnModalLabel').text('เพิ่มการคืนสินค้า');
-                $('input[name="action"]').val('add');
-                $('input[name="id"]').val('0');
-                $('#returnForm')[0].reset();
-                $('#return_code').val('<?php echo $new_return_code; ?>');
-                $('#return_date').val('<?php echo date('Y-m-d\TH:i'); ?>');
-                $('#itemsBody').empty();
-                updateTotal();
+            $('#returnsTable').DataTable({
+                language: { url: '//cdn.datatables.net/plug-ins/1.13.6/i18n/th.json' }
             });
             
-            // เปลี่ยนการขาย
-            // --- เปิดใช้ Select2 + AJAX ค้นหาใบขาย ---
-             // ถ้าอยู่ใน modal ให้อ้างอิง id ของ modal ตรงนี้
-             $(function () {
-  const $modal = $('#returnModal');           // ← เปลี่ยนให้ตรง id โมดอลจริงของคุณ
-  const $sale  = $('#sale_id');
-
-  // เผื่อมีการ set disabled โดยเผลอ
-  $sale.prop('disabled', false).removeAttr('readonly');
-
-  $sale.select2({
-    placeholder: 'ค้นหาเลขที่ขาย...',
-    allowClear: true,
-    minimumInputLength: 2,
-    width: '100%',
-    // สำคัญมาก: ทำให้ dropdown/กล่องค้นหาไปอยู่ใน modal เดียวกัน แก้ปัญหาโฟกัส/พิมพ์ไม่ได้
-    dropdownParent: $modal.length ? $modal : $(document.body),
-    ajax: {
-      url: '../ajax/get_sale_items.php',     // ปรับพาธให้ถูกกับโปรเจกต์จริง
-      type: 'GET',
-      dataType: 'json',
-      delay: 250,
-      data: params => ({ q: params.term || '' }),
-      processResults: data => ({
-        results: data.map(row => ({
-          id: row.id,
-          text: (row.sale_code || '') + (row.customer_name ? ' - ' + row.customer_name : ''),
-          customer_id: row.customer_id || '',
-          customer_name: row.customer_name || ''
-        }))
-      }),
-      cache: true
-    }
-  });
-
-  // เปิดแล้วโฟกัสช่องค้นหาให้เลย (จะได้พิมพ์ได้ทันที)
-  $sale.on('select2:open', function () {
-    setTimeout(() => {
-      const input = document.querySelector('.select2-container .select2-search__field');
-      if (input) input.focus();
-    }, 0);
-  });
-
-  // เลือกแล้วทำงานต่อเดิม
-  $sale.on('select2:select', function (e) {
-    const d = e.params.data || {};
-    if ($('#customer_id').length)   $('#customer_id').val(d.customer_id || '');
-    if ($('#customer_name').length) $('#customer_name').val(d.customer_name || '');
-    if (typeof loadSaleItems === 'function') loadSaleItems(d.id);
-  });
-});
-            
-            // เพิ่มรายการสินค้า
-            $('#addItemBtn').click(function() {
-                addItemRow();
+            $('#saleSelect').select2({
+                dropdownParent: $('#returnModal')
+            }).on('change', function() {
+                const option = $(this).find(':selected');
+                $('#customerId').val(option.data('customer'));
+                loadSaleItems($(this).val());
             });
-            
-            // เปิด modal ยืนยันการลบ
-            $('.btn-delete').click(function() {
-                const id = $(this).data('id');
-                const code = $(this).data('code');
-                
-                $('#deleteReturnCode').text(code);
-                $('#confirmDeleteBtn').attr('href', 'returns.php?action=delete&id=' + id);
-                
-                $('#deleteConfirmModal').modal('show');
-            });
-            
-            // กำหนด DataTable
-            <?php if ($action !== 'view'): ?>
-                $('#returnsTable').DataTable({
-                    language: {
-                        url: '//cdn.datatables.net/plug-ins/1.13.6/i18n/th.json'
-                    },
-                    order: [[0, 'desc']],
-                    responsive: true
-                });
-            <?php endif; ?>
         });
         
-        // ฟังก์ชันเพิ่มรายการสินค้า
-        function addItemRow(productId = '', productName = '', quantity = 1, unitPrice = 0, reason = '') {
-            const index = $('#itemsBody tr').length;
+        let itemCounter = 0;
+        
+        function loadSaleItems(saleId) {
+            if (!saleId) return;
+            
+            $.get('../ajax/get_sale_items.php', { sale_id: saleId }, function(items) {
+                $('#itemsBody').empty();
+                items.forEach(item => {
+                    addItemRow(item.product_id, item.product_name, item.product_code, item.quantity, item.unit_price);
+                });
+            });
+        }
+        
+        function addItemRow(productId = '', productName = '', productCode = '', qty = 1, price = 0) {
             const row = `
-                <tr>
+                <tr id="row-${itemCounter}">
                     <td>
                         <input type="hidden" name="product_id[]" value="${productId}">
-                        <input type="text" class="form-control product-search" placeholder="ค้นหาสินค้า (รหัสหรือชื่อ)" value="${productName}" data-index="${index}">
-                        <div class="product-suggestions" id="suggestions-${index}"></div>
+                        <div><strong>${productName}</strong></div>
+                        <small class="text-muted">รหัส: ${productCode}</small>
                     </td>
+                    <td><input type="number" name="quantity[]" class="form-control form-control-sm" value="${qty}" min="1"></td>
+                    <td><input type="number" name="unit_price[]" class="form-control form-control-sm" value="${price}" step="0.01" readonly></td>
                     <td>
-                        <input type="number" class="form-control quantity" name="quantity[]" value="${quantity}" min="1" data-index="${index}">
-                    </td>
-                    <td>
-                        <input type="number" class="form-control unit-price" name="unit_price[]" value="${unitPrice}" step="0.01" min="0" data-index="${index}">
-                    </td>
-                    <td class="subtotal">฿0.00</td>
-                    <td>
-                        <select class="form-select action-type" name="action_type[]" data-index="${index}">
+                        <select name="action_type[]" class="form-select form-select-sm action-select" data-row="${itemCounter}">
                             <option value="refund">คืนเงิน</option>
                             <option value="exchange">เปลี่ยนสินค้า</option>
                             <option value="store_credit">เครดิตร้าน</option>
                         </select>
                     </td>
                     <td>
-                        <input type="hidden" class="exchange-product-id" name="exchange_product_id[]" value="">
-                        <input type="text" class="form-control exchange-product-search" placeholder="ป้อนรหัสสินค้า" data-index="${index}" disabled>
-                        <div class="exchange-product-suggestions" id="exchange-suggestions-${index}"></div>
-                        <!-- เพิ่มส่วนแสดงข้อมูลสินค้า -->
-                        <div class="exchange-product-info mt-2 p-2 bg-light rounded" id="exchange-info-${index}" style="display: none;">
-                            <div class="product-details">
-                                <small>
-                                    <div><strong>ชื่อ:</strong> <span class="info-name"></span></div>
-                                    <div><strong>ราคา:</strong> ฿<span class="info-price"></span></div>
-                                    <div><strong>คงเหลือ:</strong> <span class="info-stock"></span></div>
-                                </small>
-                            </div>
+                        <input type="hidden" name="exchange_product_id[]" id="exchange-id-${itemCounter}">
+                        <input type="text" class="form-control form-control-sm exchange-code" 
+                               id="exchange-code-${itemCounter}" 
+                               placeholder="ระบุรหัสสินค้า" disabled>
+                        <div id="exchange-info-${itemCounter}" class="exchange-product-info" style="display:none;">
+                            <div class="info-label">ชื่อ: <span class="info-value" id="exchange-name-${itemCounter}"></span></div>
+                            <div class="info-label">ราคา: <span class="info-value" id="exchange-price-${itemCounter}"></span></div>
+                            <div class="info-label">สต็อก: <span class="info-value" id="exchange-stock-${itemCounter}"></span></div>
                         </div>
                     </td>
-                    <td>
-                        <input type="text" class="form-control item-reason" name="item_reason[]" value="${reason}" placeholder="เหตุผล">
-                    </td>
-                    <td>
-                        <button type="button" class="btn btn-sm btn-danger remove-item">
-                            <i class="bi bi-trash"></i>
-                        </button>
-                    </td>
+                    <td><input type="text" name="item_reason[]" class="form-control form-control-sm" placeholder="เหตุผล"></td>
+                    <td><button type="button" class="btn btn-sm btn-danger" onclick="removeRow(${itemCounter})"><i class="bi bi-trash"></i></button></td>
                 </tr>
             `;
             
             $('#itemsBody').append(row);
             
-            // ตั้งค่า event listeners สำหรับแถวใหม่
-            const newRow = $('#itemsBody tr:last');
-            newRow.find('.quantity, .unit-price').on('input', function() {
-                updateRowTotal($(this).data('index'));
+            // Event listener for action change
+            $(`.action-select[data-row="${itemCounter}"]`).on('change', function() {
+                const rowId = $(this).data('row');
+                const isExchange = $(this).val() === 'exchange';
+                $(`#exchange-code-${rowId}`).prop('disabled', !isExchange);
+                if (!isExchange) {
+                    $(`#exchange-id-${rowId}`).val('');
+                    $(`#exchange-info-${rowId}`).hide();
+                }
             });
             
-            newRow.find('.action-type').change(function() {
-                const index = $(this).data('index');
-                const action = $(this).val();
+            // Event listener for exchange product code
+            $(`#exchange-code-${itemCounter}`).on('blur', function() {
+                const code = $(this).val().trim();
+                const rowId = $(this).attr('id').split('-')[2];
                 
-                if (action === 'exchange') {
-                    newRow.find('.exchange-product-search').prop('disabled', false);
-                } else {
-                    newRow.find('.exchange-product-search').prop('disabled', true);
-                    newRow.find('.exchange-product-id').val('');
-                    newRow.find('.exchange-product-search').val('');
-                    $(`#exchange-info-${index}`).hide();
-                }
-            });
-            
-            newRow.find('.remove-item').click(function() {
-                $(this).closest('tr').remove();
-                updateTotal();
-            });
-            
-            // ตั้งค่าการค้นหาสินค้า
-            setupProductSearch(newRow.find('.product-search'), index, false);
-            setupProductSearch(newRow.find('.exchange-product-search'), index, true);
-            
-            // ตรวจสอบการป้อนรหัสสินค้าโดยตรง
-            newRow.find('.exchange-product-search').on('blur', function() {
-                const inputVal = $(this).val();
-                if (inputVal && inputVal.length > 0) {
-                    // ถ้าเป็นรหัสสินค้า (ขึ้นต้นด้วย P ตามด้วยตัวเลข)
-                    if (/^P\d+$/.test(inputVal)) {
-                        loadProductByCode(inputVal, index);
-                    }
-                }
-            });
-            
-            // อัปเดตยอดรวม
-            updateRowTotal(index);
-        }
-        
-        // ตั้งค่าการค้นหาสินค้า
-        function setupProductSearch(input, index, isExchange) {
-            input.on('input', function() {
-                const query = $(this).val();
-                if (query.length < 2) {
-                    $(isExchange ? '#exchange-suggestions-' + index : '#suggestions-' + index).empty();
-                    return;
-                }
-                
-                // AJAX ค้นหาสินค้า
-                $.ajax({
-                    url: '../ajax/search_products.php',
-                    method: 'GET',
-                    data: { q: query },
-                    success: function(response) {
-                        let suggestions = '';
-                        response.forEach(function(product) {
-                            suggestions += `
-                                <div class="suggestion-item" data-id="${product.id}" data-name="${product.product_name}" data-price="${product.sale_price}" data-stock="${product.quantity}">
-                                    ${product.product_code} - ${product.product_name} (คงเหลือ: ${product.quantity})
-                                </div>
-                            `;
-                        });
-                        
-                        $(isExchange ? '#exchange-suggestions-' + index : '#suggestions-' + index).html(suggestions);
-                        
-                        // คลิกเลือกสินค้า
-                        $('.suggestion-item').click(function() {
-                            const productId = $(this).data('id');
-                            const productName = $(this).data('name');
-                            const price = $(this).data('price');
-                            const stock = $(this).data('stock');
+                if (code) {
+                    $.get('../ajax/get_product_by_code.php', { code: code }, function(product) {
+                        if (product && !product.error) {
+                            $(`#exchange-id-${rowId}`).val(product.id);
+                            $(`#exchange-name-${rowId}`).text(product.product_name);
+                            $(`#exchange-price-${rowId}`).text('฿' + parseFloat(product.sale_price).toFixed(2));
+                            $(`#exchange-stock-${rowId}`).text(product.quantity + ' ชิ้น');
                             
-                            if (isExchange) {
-                                input.val(productName);
-                                input.closest('tr').find('.exchange-product-id').val(productId);
-                                
-                                // แสดงข้อมูลสินค้า
-                                const infoDiv = $(`#exchange-info-${index}`);
-                                infoDiv.find('.info-name').text(productName);
-                                infoDiv.find('.info-price').text(price.toFixed(2));
-                                infoDiv.find('.info-stock').text(stock);
-                                infoDiv.show();
+                            const qty = $(`#row-${rowId} input[name="quantity[]"]`).val();
+                            if (parseInt(product.quantity) < parseInt(qty)) {
+                                $(`#exchange-stock-${rowId}`).parent().addClass('text-danger');
+                                Swal.fire('แจ้งเตือน', 'สต็อกสินค้าไม่เพียงพอ!', 'warning');
                             } else {
-                                input.val(productName);
-                                input.closest('tr').find('input[name="product_id[]"]').val(productId);
-                                input.closest('tr').find('.unit-price').val(price);
-                                updateRowTotal(index);
+                                $(`#exchange-stock-${rowId}`).parent().removeClass('text-danger');
                             }
                             
-                            $(isExchange ? '#exchange-suggestions-' + index : '#suggestions-' + index).empty();
-                        });
-                    }
-                });
-            });
-            
-            // ซ่อน suggestions เมื่อคลิก其他地方
-            $(document).click(function(e) {
-                if (!$(e.target).closest('.product-search, .product-suggestions, .exchange-product-search, .exchange-product-suggestions').length) {
-                    $('.product-suggestions, .exchange-product-suggestions').empty();
-                }
-            });
-            
-            // ล้างข้อมูลเมื่อลบการค้นหา
-            input.on('keyup', function(e) {
-                if (e.key === 'Delete' || e.key === 'Backspace') {
-                    if ($(this).val().length === 0 && isExchange) {
-                        $(`#exchange-info-${index}`).hide();
-                        input.closest('tr').find('.exchange-product-id').val('');
-                    }
-                }
-            });
-        }
-        
-        // ฟังก์ชันโหลดข้อมูลสินค้าจากรหัส
-        function loadProductByCode(productCode, index) {
-            if (!productCode) return;
-            
-            $.ajax({
-                url: '../ajax/get_product_by_code.php',
-                method: 'GET',
-                data: { code: productCode },
-                success: function(product) {
-                    if (product) {
-                        const row = $(`#itemsBody tr:eq(${index})`);
-                        row.find('.exchange-product-id').val(product.id);
-                        
-                        // แสดงข้อมูลสินค้า
-                        const infoDiv = $(`#exchange-info-${index}`);
-                        infoDiv.find('.info-name').text(product.product_name);
-                        infoDiv.find('.info-price').text(parseFloat(product.sale_price).toFixed(2));
-                        infoDiv.find('.info-stock').text(product.quantity);
-                        infoDiv.show();
-                    }
-                }
-            });
-        }
-        
-        // อัปเดตยอดรวมของแถว
-        function updateRowTotal(index) {
-            const row = $(`#itemsBody tr:eq(${index})`);
-            const quantity = parseFloat(row.find('.quantity').val()) || 0;
-            const unitPrice = parseFloat(row.find('.unit-price').val()) || 0;
-            const subtotal = quantity * unitPrice;
-            
-            row.find('.subtotal').text('฿' + subtotal.toFixed(2));
-            updateTotal();
-        }
-        
-        // อัปเดตยอดรวมทั้งหมด
-        function updateTotal() {
-            let total = 0;
-            
-            $('#itemsBody tr').each(function() {
-                const quantity = parseFloat($(this).find('.quantity').val()) || 0;
-                const unitPrice = parseFloat($(this).find('.unit-price').val()) || 0;
-                total += quantity * unitPrice;
-            });
-            
-            $('#totalAmount').text('฿' + total.toFixed(2));
-            $('#total_amount').val(total);
-            $('#refund_amount').val(total);
-        }
-        
-        // โหลดรายการสินค้าจากการขาย
-        function loadSaleItems(saleId) {
-            if (!saleId) return;
-            
-            $.ajax({
-                url: '../ajax/get_sale_items.php',
-                method: 'GET',
-                data: { sale_id: saleId },
-                success: function(response) {
-                    $('#itemsBody').empty();
-                    
-                    response.forEach(function(item) {
-                        addItemRow(
-                            item.product_id, 
-                            item.product_name, 
-                            item.quantity, 
-                            item.unit_price,
-                            ''
-                        );
+                            $(`#exchange-info-${rowId}`).show();
+                        } else {
+                            Swal.fire('ไม่พบสินค้า', 'ไม่พบสินค้ารหัส: ' + code, 'error');
+                            $(`#exchange-id-${rowId}`).val('');
+                            $(`#exchange-info-${rowId}`).hide();
+                        }
+                    }).fail(function() {
+                        Swal.fire('ข้อผิดพลาด', 'ไม่สามารถค้นหาสินค้าได้', 'error');
                     });
-                    
-                    updateTotal();
+                }
+            });
+            
+            itemCounter++;
+        }
+        
+        function removeRow(id) {
+            $(`#row-${id}`).remove();
+        }
+        
+        function updateStatus(id, status) {
+            Swal.fire({
+                title: 'ยืนยันการอัพเดทสถานะ?',
+                icon: 'question',
+                showCancelButton: true,
+                confirmButtonText: 'ยืนยัน',
+                cancelButtonText: 'ยกเลิก'
+            }).then((result) => {
+                if (result.isConfirmed) {
+                    window.location.href = `returns.php?action=update_status&id=${id}&status=${status}`;
                 }
             });
         }
         
-        // อัปเดตสถานะ
-        function updateStatus(id, status) {
-            if (confirm('คุณแน่ใจว่าต้องการอัปเดตสถานะใช่หรือไม่?')) {
-                window.location.href = 'returns.php?action=update_status&id=' + id + '&status=' + status;
-            }
+        function confirmDelete(id, code) {
+            Swal.fire({
+                title: 'ยืนยันการลบ?',
+                html: `คุณต้องการลบการคืนสินค้า <strong>${code}</strong>?<br><small class="text-danger">สต็อกจะถูกคืนกลับสู่สถานะเดิม</small>`,
+                icon: 'warning',
+                showCancelButton: true,
+                confirmButtonText: 'ลบ',
+                confirmButtonColor: '#dc3545',
+                cancelButtonText: 'ยกเลิก'
+            }).then((result) => {
+                if (result.isConfirmed) {
+                    window.location.href = `returns.php?action=delete&id=${id}`;
+                }
+            });
         }
     </script>
 </body>
