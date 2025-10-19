@@ -40,7 +40,7 @@ if (!isLoggedIn()) {
         }
 
         .header {
-            background: linear-gradient(135deg, #ff416c, #ff4757);
+            background: linear-gradient(135deg, #ff416c, #ec0418ff);
             color: white;
             padding: 30px;
             text-align: center;
