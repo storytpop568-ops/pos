@@ -2309,6 +2309,17 @@ ALTER TABLE `sale_items`
 CREATE DATABASE IF NOT EXISTS `test` DEFAULT CHARACTER SET latin1 COLLATE latin1_swedish_ci;
 USE `test`;
 COMMIT;
+---------------------------------------------------
+
+CREATE TABLE stock_movements (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    product_id INT NOT NULL,
+    movement_type ENUM('in', 'out', 'return', 'exchange_in', 'exchange_out'),
+    quantity INT NOT NULL,
+    note TEXT,
+    user_id INT,
+    created_at TIMESTAMP
+)
 
 /*!40101 SET CHARACTER_SET_CLIENT=@OLD_CHARACTER_SET_CLIENT */;
 /*!40101 SET CHARACTER_SET_RESULTS=@OLD_CHARACTER_SET_RESULTS */;
